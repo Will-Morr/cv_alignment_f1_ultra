@@ -74,7 +74,8 @@ material thickness changes.
   is the only level that doesn't saturate light wood in the camera's auto-exposure.
 - Autofocus only works after switching the device mode to `P_AUTOFOCUS`, with a moment for the mode
   to settle; it takes about 30 s and resets the fill light.
-- With the lid open the fill light is off and the camera returns black frames; the tool refuses to
-  photograph until the lid sensor reads closed.
+- After autofocus the camera returns black frames until a job runs; `take_photo` fires an empty
+  zero-power job to reset it. The `gap` (lid) sensor reads `off` with the lid closed on this unit,
+  opposite to the reference docs, so it is not used.
 - The camera returns 2592x1944 or 4656x3496 depending on mood; the tool normalises to 2592 wide.
 - Protocol reference: https://github.com/thecodingdad/ha-xtool (docs/PROTOCOL.md).

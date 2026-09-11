@@ -28,7 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.textpath import TextPath
 from matplotlib.font_manager import FontProperties
-from F1_ultra_driver import F1Ultra, make_cut_gcode
+from F1_ultra_driver import F1Ultra, make_cut_gcode, make_xf
 
 CALIB_FILE = "camera_calib.json"
 IMG_W, IMG_H = 2592, 1944   # camera returns 2592x1944 or 4656x3496 (same FOV); normalise to this
@@ -70,24 +70,24 @@ def save(name, obj):
 # Camera
 # ---------------------------------------------------------------------------
 
-def take_photo(laser, tries=10):
+def take_photo(laser, tries=6):
     """Lit, normalised BGR photo of the bed.
 
-    The fill light is reset after every job and autofocus, and the camera can return dark or
-    blown-out frames for a few seconds afterwards, so keep re-arming the light and retrying
-    until the frame is usable (not dark, not saturated).
+    After an autofocus (and sometimes a lid cycle) the camera returns black frames and the fill
+    light cannot be re-armed by the brightness call alone; running an empty zero-power job
+    resets it. Frames are retried until neither dark nor saturated.
     """
-    if laser.request("/v1/peripheral/param", "GET", params={"type": "gap"}).get("state") != "on":
-        raise RuntimeError("lid is open: the fill light is off and the camera returns black frames")
-    for _ in range(tries):
+    for i in range(tries):
         laser.set_fill_light(FILL_LIGHT)
         time.sleep(2)
         img = cv2.imdecode(np.frombuffer(laser.snap(), np.uint8), cv2.IMREAD_COLOR)
         g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         if np.median(g) > 40 and (g >= 250).mean() < 0.05:
             break
+        if np.median(g) <= 40:
+            laser.run_job(make_xf(""))   # header + footer only, laser power 0: wakes the camera/light
     else:
-        raise RuntimeError("could not get a usable photo (dark or saturated)")
+        raise RuntimeError("could not get a usable photo (dark or saturated); is the lid closed?")
     if img.shape[1] != IMG_W:
         img = cv2.resize(img, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
     return img
