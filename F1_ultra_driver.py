@@ -1,18 +1,34 @@
-import numpy as np
-import random
-import math
-import tarfile
+"""LAN driver for the xTool F1 Ultra on "V2" firmware (>= 40.52).
+
+The old plain-HTTP API on ports 8080/8329 is gone. Everything now goes over a
+TLS WebSocket on port 28900:
+
+* ``function=instruction`` carries JSON requests/responses plus push events,
+  each wrapped in a CRC16 binary envelope (magic 0xBABE).
+* ``function=file_stream`` carries bulk bytes (camera JPEGs down, job files up)
+  with a sliding-window transfer protocol driven by FILE_REQUEST/FILE_DATA packets.
+
+Protocol reference (reverse engineered): https://github.com/thecodingdad/ha-xtool
+"""
 import io
 import ssl
 import json
 import time
+import tarfile
 import hashlib
 import threading
-from PIL import Image
 from websockets.sync.client import connect as ws_connect
 
-header = """
-G90
+HOST = "192.168.1.210"
+PORT = 28900
+XF_TEMPLATE = "F1-Ultra-template.xf"
+
+# ---------------------------------------------------------------------------
+# G-code / .xf job packaging
+# ---------------------------------------------------------------------------
+
+# Job prologue/epilogue as emitted by xTool Creative Space for this machine.
+GCODE_HEADER = """G90
 G0 F3000
 G4M1
 M9064 B2
@@ -22,153 +38,83 @@ G0 F180000
 M4 S0
 G1 F180000
 G0 X0 Y0
-
 G102
 G91
-#G0Z4F600
 G103
 G90
 G0 F180000
 """
 
-footer = """
-# END
+GCODE_FOOTER = """# END
 # GS002 TAIL
-
-
-
 G102
-#G91
-#G0Z-4F600
 G103
-
-
-
-
 G90
 G0 S0
 G0 F180000
 G1 F180000
 M536 U0
 M6 P1
-
 """
 
-def make_cut_gcode(paths,
-        Z = 0.0,   # mm
-        power = 60.0, # %
-        speed = 50.0, #mm/s
-    ):
-    # G0 move XY
-    # G1 cut, XY s=power, f=feedrate
-    # G0Q30 frequency 30-60
 
-    # Put your gcode here
+def make_cut_gcode(paths, power=60.0, speed=50.0):
+    """Vector G-code for a list of polylines in laser mm.
 
-    contents = f"""
-# Do this when the laser changes:
-# GS002 VECTOR HEAD
-# motion_start
-G4M1
-#G21=Blue or G22=fiber for which laser to use
-G21
-G90 # Absolute moves for laser
-G0Q30 # 30 kHz for fiber laser
+    paths: iterable of [(x, y), ...]; power in %, speed in mm/s.
+    Uses the blue diode (G21). Z is not touched: focus before running.
+    """
+    lines = [
+        "# GS002 VECTOR HEAD",
+        "# motion_start",
+        "G4M1",
+        "G21",      # blue diode laser (G22 = infrared)
+        "G90",
+        "G0Q30",    # pulse frequency kHz (only matters for the IR source)
+        "G4M1",
+        "M523P40",
+    ]
+    for path in paths:
+        x0, y0 = path[0]
+        lines.append(f"G0X{x0:.3f}Y{y0:.3f}")
+        for x, y in path[1:]:
+            lines.append(f"G1X{x:.3f}Y{y:.3f}S{power * 10:.0f}F{speed:.0f}")   # S is % * 10
+    return "\n".join(lines) + "\n"
 
-G4M1
-M523P40
 
-# Z move
-# G102
-# G91 #incremental
-# G0Z{Z}F600
-# G90 #absolute
-# G103
-# G0F180000
-"""
-
-    def round3(v):
-        return round(v, 3)
-
-    parts = []
-
-    for fooPath in paths:
-        x0, y0 = fooPath[0]
-        parts.append(f"G0X{round3(x0)}Y{round3(y0)}")
-
-        for x, y in fooPath[1:]:
-            parts.append(f"G1X{round3(x)}Y{round3(y)}S{power*10.0}F{speed}") # power is in %*10
-
-    parts.append("")
-
-    contents += '\n'.join(parts)
-
-    # // TODO: Return z to start
-    # result.push("#".to_string());
-    # result.push(format!("G0Z{}", round3(23.0)));
-
-    return contents
-
-def make_xf(contents):
-    filename = "F1-Ultra-template.xf"
-    t = tarfile.open(filename, 'r')
-    files = t.getmembers()
-
-    tar_fileobj = io.BytesIO()
-
-    #output = tarfile.open('the_test_file.xf','w')
-    output = tarfile.open(fileobj=tar_fileobj, mode='w')
-
-    # tarfile.TarInfo("preview.jpg")
-    # tarfile.TarInfo("motion.gcode")
-    # tarfile.TarInfo("description.json")
-    # tarfile.TarInfo("border.gcode")
-
-    for part in files:
-        f = t.extractfile(part)
-        data = f.read()
-        print(part.name, data[:100])
-
-        if part.name == 'motion.gcode':
-            info = tarfile.TarInfo("motion.gcode")
-            data = header+contents+footer
-            data = data.replace('\n', '\r\n')
-            info.size = len(data)
-            output.addfile(info, io.BytesIO(data.encode()))
-            #print(data.encode())
-        else:
-            info = tarfile.TarInfo(part.name)
-            info.size = len(data)
-            output.addfile(info, io.BytesIO(data))
-    output.close()
-    print("Done")
-    tar_fileobj.seek(0)
-    return tar_fileobj.read()
+def make_xf(gcode):
+    """Build a .xf job package (a tar) by swapping motion.gcode in the template."""
+    src = tarfile.open(XF_TEMPLATE, "r")
+    buf = io.BytesIO()
+    out = tarfile.open(fileobj=buf, mode="w")
+    for member in src.getmembers():
+        data = src.extractfile(member).read()
+        if member.name == "motion.gcode":
+            data = (GCODE_HEADER + gcode + GCODE_FOOTER).replace("\n", "\r\n").encode()
+        info = tarfile.TarInfo(member.name)
+        info.size = len(data)
+        out.addfile(info, io.BytesIO(data))
+    out.close()
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
-# xTool "V2" LAN protocol (firmware >= 40.52 on the F1 Ultra).
-# The old plain-HTTP API on :8080/:8329 is gone. Everything now goes over a TLS
-# WebSocket on :28900. JSON requests ride in a CRC16-framed binary envelope on
-# the "instruction" channel; bulk bytes (camera JPEGs, job files) go over a
-# separate "file_stream" channel with a sliding-window transfer protocol.
-# Reverse-engineered by https://github.com/thecodingdad/ha-xtool (docs/PROTOCOL.md).
+# Wire framing
 # ---------------------------------------------------------------------------
 
-HOST = "192.168.1.210"
-
-_SSL = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_SSL = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)   # device cert is self-signed by xTool's own CA
 _SSL.check_hostname = False
 _SSL.verify_mode = ssl.CERT_NONE
 
-PT_JSON = 4
+PT_JSON = 4          # envelope protocol types
 PT_FILE = 33
-FILE_REQUEST = 1
+FILE_REQUEST = 1     # file_stream opcodes
 FILE_DATA = 129
-PING_TXN = 65510
+PING_TXN = 65510     # transaction id reserved for heartbeats
 
 
 def _crc16(data):
+    """CRC-16/ARC (poly 0xA001 reflected, init 0)."""
     crc = 0
     for b in data:
         crc ^= b
@@ -178,6 +124,7 @@ def _crc16(data):
 
 
 def _frame(payload, ptype=PT_JSON, crc=True):
+    """10-byte header: magic, 3-byte length, type (bit7 = CRC disabled), payload CRC, header CRC."""
     h = bytearray(10)
     h[0:2] = b"\xba\xbe"
     h[2:5] = len(payload).to_bytes(3, "big")
@@ -188,29 +135,42 @@ def _frame(payload, ptype=PT_JSON, crc=True):
 
 
 def _unframe(buf):
-    """Return (frames, remainder). Frames are (ptype, payload)."""
+    """Split a byte buffer into complete frames. Returns ([(ptype, payload)], remainder)."""
     frames, pos = [], 0
     while pos + 10 <= len(buf):
-        if buf[pos:pos+2] != b"\xba\xbe":
+        if buf[pos:pos + 2] != b"\xba\xbe":
             pos += 1
             continue
-        n = int.from_bytes(buf[pos+2:pos+5], "big")
+        n = int.from_bytes(buf[pos + 2:pos + 5], "big")
         if pos + 10 + n > len(buf):
             break
-        if _crc16(buf[pos:pos+8]) != int.from_bytes(buf[pos+8:pos+10], "big"):
+        if _crc16(buf[pos:pos + 8]) != int.from_bytes(buf[pos + 8:pos + 10], "big"):
             pos += 1
             continue
-        payload = buf[pos+10:pos+10+n]
-        if not (buf[pos+5] & 0x80) and _crc16(payload) != int.from_bytes(buf[pos+6:pos+8], "big"):
+        payload = buf[pos + 10:pos + 10 + n]
+        if not (buf[pos + 5] & 0x80) and _crc16(payload) != int.from_bytes(buf[pos + 6:pos + 8], "big"):
             pos += 1
             continue
-        frames.append((buf[pos+5] & 0x7F, payload))
+        frames.append((buf[pos + 5] & 0x7F, payload))
         pos += 10 + n
     return frames, buf[pos:]
 
 
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
 class F1Ultra:
-    def __init__(self, host=HOST, verbose=True):
+    """Connection to one machine. Use as a context manager::
+
+        with F1Ultra() as laser:
+            jpg = laser.snap()
+            laser.run_job(make_xf(make_cut_gcode(paths, power=80, speed=3000)))
+
+    ``events`` collects push events (mode changes, head position, work results).
+    """
+
+    def __init__(self, host=HOST, verbose=False):
         self.host = host
         self.verbose = verbose
         self.session_id = int(time.time() * 1000)
@@ -219,9 +179,12 @@ class F1Ultra:
         self.ws = None
         self.rx = b""
         self.events = []
+        self._alive = False
+
+    # ---- connection -------------------------------------------------------
 
     def _url(self, function):
-        return f"wss://{self.host}:28900/websocket?id={self.session_id}&function={function}"
+        return f"wss://{self.host}:{PORT}/websocket?id={self.session_id}&function={function}"
 
     def _open(self, function, timeout=15):
         return ws_connect(self._url(function), ssl=_SSL, max_size=None, open_timeout=timeout,
@@ -229,8 +192,9 @@ class F1Ultra:
 
     def connect(self):
         self.ws = self._open("instruction")
+        # "parity" handshake: guest credentials, must be the first request
         self.request("/v1/user/parity", "GET", data={
-            "userID": "mk-guest", "userKey": "bWFrZWJsb2NrLXh0b29s", "timezone": "America/New_York"})
+            "userID": "mk-guest", "userKey": "bWFrZWJsb2NrLXh0b29s", "timezone": "UTC"})
         self._alive = True
         threading.Thread(target=self._heartbeat, daemon=True).start()
         return self
@@ -277,6 +241,7 @@ class F1Ultra:
             self.rx += msg if isinstance(msg, bytes) else msg.encode()
 
     def request(self, url, method="GET", params=None, data=None, timeout=10):
+        """Send one API request and return its ``data``. Push events seen meanwhile go to ``events``."""
         self.txn = self.txn % 65000 + 1
         txn = self.txn
         self._send_json({"type": "request", "method": method, "url": url, "params": params or {},
@@ -284,7 +249,7 @@ class F1Ultra:
         deadline = time.time() + timeout
         while True:
             ev = self._read_json(deadline - time.time())
-            ev_txn = ev.get("transactionId", (ev.get("data") or {}).get("transactionId") if isinstance(ev.get("data"), dict) else None)
+            ev_txn = ev.get("transactionId")
             if ev.get("type") == "response" and ev_txn == PING_TXN:
                 continue
             if ev.get("type") == "response" and ev_txn == txn:
@@ -303,7 +268,16 @@ class F1Ultra:
         self.channel = (self.channel + 1) & 0xFF
         return self.channel
 
+    def _finish(self, ch):
+        # Firmware answers code -1 after camera downloads even though the transfer completed.
+        try:
+            self.request("/v1/filetransfer/finish", "PUT",
+                         data={"code": 0, "message": "file transfer finish", "channel": ch})
+        except RuntimeError:
+            pass
+
     def download(self, filename, filetype=5, timeout=30):
+        """Fetch a file from the device (filetype 5 = camera/log blobs). MD5 is verified."""
         ch = self._next_channel()
         hs = self.request("/v1/filetransfer/download", "PUT", data={
             "filetype": filetype, "filename": filename, "digesttype": 1,
@@ -311,7 +285,7 @@ class F1Ultra:
         size = int(hs["filesize"])
         window = min(5 * 1024 * 1024, int(hs.get("packetsize") or 5 * 1024 * 1024))
         buf = bytearray(size)
-        got = 0
+        got = win_got = 0
         with self._open("file_stream") as fs:
             def req(offset):
                 n = min(window, size - offset)
@@ -319,7 +293,6 @@ class F1Ultra:
                 fs.send(_frame(pkt, PT_FILE, crc=False))
                 return n
             want = req(0)
-            win_got = 0
             scan = b""
             deadline = time.time() + timeout
             while got < size:
@@ -330,7 +303,7 @@ class F1Ultra:
                         continue
                     off = int.from_bytes(p[2:7], "big")
                     content = p[7:]
-                    buf[off:off+len(content)] = content
+                    buf[off:off + len(content)] = content
                     got += len(content)
                     win_got += len(content)
                 if win_got >= want and got < size:
@@ -341,21 +314,13 @@ class F1Ultra:
         self._finish(ch)
         return bytes(buf)
 
-    def _finish(self, ch):
-        # Firmware answers code -1 for camera snaps even though the transfer is complete.
-        try:
-            self.request("/v1/filetransfer/finish", "PUT", data={"code": 0, "message": "file transfer finish", "channel": ch})
-        except RuntimeError as e:
-            if self.verbose:
-                print(f"[laser] finish ignored: {e}")
-
     def upload(self, blob, filename, filetype=1, timeout=120):
-        """Push a blob to the device. The device drives the transfer by sending
-        FILE_REQUEST windows; we answer each with FILE_DATA packets."""
+        """Push a file to the device. The device asks for windows with FILE_REQUEST; we answer with FILE_DATA."""
         ch = self._next_channel()
         hs = self.request("/v1/filetransfer/upload", "PUT", data={
             "filetype": filetype, "filename": filename, "filesize": len(blob), "digesttype": 1,
-            "digestdata": hashlib.md5(blob).hexdigest(), "channel": ch, "packetsize": 1024 * 1024}, timeout=timeout)
+            "digestdata": hashlib.md5(blob).hexdigest(), "channel": ch, "packetsize": 1024 * 1024},
+            timeout=timeout)
         packet = int(hs.get("packetsize") or 64 * 1024)
         sent_to = 0
         with self._open("file_stream") as fs:
@@ -366,14 +331,9 @@ class F1Ultra:
                 frames, scan = _unframe(scan)
                 for ptype, p in frames:
                     if ptype != PT_FILE or len(p) < 10 or p[0] != FILE_REQUEST or p[1] != ch:
-                        if self.verbose:
-                            print(f"[laser] file_stream: ignoring frame ptype={ptype} {p[:12].hex()}")
                         continue
                     off = int.from_bytes(p[2:7], "big")
-                    win = int.from_bytes(p[7:10], "big")
-                    end = min(off + win, len(blob))
-                    if self.verbose:
-                        print(f"[laser] FILE_REQUEST offset={off} window={win}")
+                    end = min(off + int.from_bytes(p[7:10], "big"), len(blob))
                     while off < end:
                         chunk = blob[off:min(off + packet, end)]
                         fs.send(_frame(bytes([FILE_DATA, ch]) + off.to_bytes(5, "big") + chunk, PT_FILE))
@@ -387,71 +347,68 @@ class F1Ultra:
         return self.request("/v1/device/machineInfo")
 
     def status(self):
+        """Runtime info; ``["curMode"]["mode"]`` is P_IDLE / P_SLEEP / Work / P_WORKING / P_WORK_DONE ..."""
         return self.request("/v1/device/runtime-infos")
 
+    def set_mode(self, mode):
+        return self.request("/v1/device/mode", "PUT", data={"mode": mode})
+
     def snap(self):
+        """JPEG bytes from the bed camera (2592x1944 or 4656x3496, same field of view)."""
         r = self.request("/v1/camera/snap", "GET", params={"name": "main"}, timeout=30)
         return self.download(r["filename"], filetype=5)
 
+    def set_fill_light(self, value):
+        """Bed illumination 0-255. Turns off after every job."""
+        return self.request("/v1/peripheral/param", "PUT", params={"type": "fill_light"},
+                            data={"action": "set_bri", "idx": 1, "value": value})
+
     def go_to_z(self, z):
+        """Move the head to an absolute Z (mm). Asynchronous: watch for MOTION_MOVE_FINISHED."""
         return self.request("/v1/laser-head/focus/control", "POST",
                             data={"action": "goTo", "Z": z, "stopFirst": 1, "F": 5000}, timeout=60)
 
-    def autofocus(self, timeout=60):
-        """Run the built-in height measurement. Returns the measured Z (mm)."""
-        self.request("/v1/device/mode", "PUT", data={"mode": "P_AUTOFOCUS"})
-        self.request("/v1/laser-head/focus/control", "POST", data={"action": "auto_start", "stopFirst": 1}, timeout=timeout)
+    def autofocus(self, timeout=120):
+        """Run the built-in height measurement and move to focus (~30 s). Returns the measured Z (mm)."""
+        self.set_mode("P_IDLE")
+        time.sleep(1)
+        self.set_mode("P_AUTOFOCUS")
+        time.sleep(1)   # auto_start is ignored if sent before the mode switch settles
+        self.request("/v1/laser-head/focus/control", "POST",
+                     data={"action": "auto_start", "stopFirst": 1}, timeout=timeout)
         t0 = time.time()
         while time.time() - t0 < timeout:
-            self.status()  # drains push events
+            self.status()   # drains push events
             if any(e["data"].get("type") == "FOCUS_FINISHED" for e in self.events):
                 zs = [e["data"]["info"]["z"] for e in self.events if e.get("url") == "/laser_head/value"]
                 return zs[-1] if zs else None
             time.sleep(0.5)
         raise TimeoutError("autofocus did not finish")
 
-    def autofocus(self, timeout=60):
-        """Run the built-in height measurement. Returns the measured Z (mm)."""
-        self.request("/v1/device/mode", "PUT", data={"mode": "P_AUTOFOCUS"})
-        self.request("/v1/laser-head/focus/control", "POST", data={"action": "auto_start", "stopFirst": 1}, timeout=timeout)
+    def run_job(self, xf_bytes, auto_start=True, timeout=600):
+        """Upload a .xf package and (optionally) start it. Blocks until the job finishes."""
+        self.upload(xf_bytes, "tmp.xf", filetype=1, timeout=60)
+        task = f"PC_F1Ultra_{int(time.time() * 1000)}"
+        self.request("/v1/processing/upload/config", "PUT",
+                     data={"fileType": "xf", "autoStart": int(auto_start), "taskId": task}, timeout=30)
+        if not auto_start:
+            return task
         t0 = time.time()
         while time.time() - t0 < timeout:
-            self.status()  # drains push events
-            done = [e for e in self.events if e["data"].get("type") == "FOCUS_FINISHED"]
-            if done:
-                zs = [e["data"]["info"]["z"] for e in self.events if e.get("url") == "/laser_head/value"]
-                return zs[-1] if zs else None
+            m = self.status()["curMode"]
+            if m["mode"] == "P_WORK_DONE" and m["taskId"] == task:
+                self.set_mode("P_IDLE")
+                return task
             time.sleep(0.5)
-        raise TimeoutError("autofocus did not finish")
+        raise TimeoutError("job did not finish")
+
+    def burn(self, paths, power=80.0, speed=3000.0):
+        """Engrave polylines (laser mm) at the current Z."""
+        return self.run_job(make_xf(make_cut_gcode(paths, power, speed)))
 
 
-# Get the camera image (a jpg) with the same settings that xtool uses
-def getPhoto(outPath = None):
-    with F1Ultra() as laser:
-        data = laser.snap()
-
-    if outPath != None:
-        with open(outPath+".jpg", "wb") as f:
-            f.write(data)
-
-    return Image.open(io.BytesIO(data))
-
-def runLines(
-        inputLines,
-        Z = 0.0,   # mm, or None to leave Z where it is
-        power = 60.0, # %
-        speed = 50.0, #mm/s
-        autoStart = 1,
-        ):
-    xf_data = make_xf(make_cut_gcode(inputLines, Z, power, speed))
-    with F1Ultra() as laser:
-        if Z is not None:  # None keeps the current (e.g. autofocused) height
-            laser.go_to_z(Z)
-            time.sleep(3)
-        laser.upload(xf_data, "tmp.xf", filetype=1)
-        taskId = f"PC_F1Ultra_MXFK002B2024072307949AB_{int(time.time()*1000)}"
-        laser.request("/v1/processing/upload/config", "PUT",
-                      data={"fileType": "xf", "gcodeType": "processing", "autoStart": autoStart, "taskId": taskId})
-
-if __name__ == '__main__':
-    getPhoto('tmp')
+if __name__ == "__main__":
+    with F1Ultra(verbose=True) as laser:
+        print(json.dumps(laser.info(), indent=1)[:600])
+        open("snap.jpg", "wb").write(laser.snap())
+        print("saved snap.jpg")
