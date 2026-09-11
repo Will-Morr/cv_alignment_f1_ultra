@@ -2,3 +2,5 @@ __pycache__/
 runs/
 *.jpg
 *.png
+!docs/*.jpg
+!docs/*.png

@@ -10,8 +10,9 @@ Commands (all fire the laser except ``wood``):
 Library use::
 
     with F1Ultra() as laser:
-        H, _ = load_calib()
+        H, calib = load_calib()
         corners, quad_px, img = wood_mm(laser, H)     # workpiece corners in laser mm
+        focus(laser, calib)                           # autofocus, checked against the calibration Z
         laser.burn(align_paths(my_paths, corners))    # pattern scaled/rotated/centred on the workpiece
 """
 import os
@@ -56,6 +57,7 @@ def new_run(cmd, **meta):
 
 def save(name, obj):
     """Write an artefact into the current run directory (image, JSON-able object, or text)."""
+    os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, name)
     if isinstance(obj, np.ndarray):
         cv2.imwrite(path, obj)
@@ -179,7 +181,7 @@ def burn_and_locate(laser, points_mm, pairs, tag):
     for x, y in points_mm:
         laser.burn(hatched_square(x, y))
         img = take_photo(laser)
-        cv2.imwrite(f"{OUT}/{tag}_{x:.0f}_{y:.0f}.jpg", img)
+        save(f"{tag}_{x:.0f}_{y:.0f}.jpg", img)
         blobs = detect_dark_blobs(img, find_wood(img)[1])
         new = [b for b in blobs if all(np.hypot(*(b - s)) > 12 for s in seen)]
         if len(new) != 1:
@@ -381,7 +383,8 @@ if __name__ == "__main__":
             c, ex, ey, (w, h) = rect_frame(corners)
             print("workpiece corners mm:\n", corners.round(1))
             print(f"center {c.round(1)} size {w:.1f} x {h:.1f} mm, rotation {frame_rotation_deg(corners):.2f} deg")
-            save("workpiece.json", {"corners_mm": corners, "corners_px": quad_px, "center": c, "size": [w, h]})
+            save("workpiece.json", {"corners_mm": corners, "corners_px": quad_px, "center": c, "size": [w, h],
+                                    "rotation_deg": frame_rotation_deg(corners)})
             plot_alignment(img, H, corners, [], f"{OUT}/workpiece.png")
         elif cmd == "test":
             H, calib = load_calib()
