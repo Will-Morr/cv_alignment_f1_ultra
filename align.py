@@ -226,20 +226,27 @@ def wood_mm(laser_or_img, H):
 
 
 def rect_frame(corners_mm):
-    """Fit a rectangle to 4 corners. Returns (center, unit x axis, unit y axis, (w, h)).
+    """Fit a rectangle to 4 corners. Returns (center, unit x axis, unit y axis, (w, h)) in laser mm.
 
-    The frame is right-handed and kept within 90 deg of the laser axes, so a pattern's
-    'up' stays 'up' on the bed.
+    The frame follows the physical / camera view of the bed: x to the right, y up as you look
+    at the machine. Laser +x runs the *other* way, so a pattern expressed in raw laser
+    coordinates is mirrored on the part; anything laid out in this frame reads correctly.
     """
     c = corners_mm.mean(0)
     ex = (corners_mm[1] - corners_mm[0] + corners_mm[2] - corners_mm[3]) / 2
     w = np.linalg.norm(ex)
     ex /= w
-    if ex[0] < 0:
+    if ex[0] > 0:            # image-right is laser -x
         ex = -ex
-    ey = np.array([-ex[1], ex[0]])
+    ey = np.array([ex[1], -ex[0]])   # image-up is laser +y
     h = abs(np.dot(corners_mm[3] - corners_mm[0] + corners_mm[2] - corners_mm[1], ey)) / 2
     return c, ex, ey, (w, h)
+
+
+def frame_rotation_deg(corners_mm):
+    """Rotation of the workpiece's x edge relative to the bed, as seen in the camera view."""
+    _, ex, _, _ = rect_frame(corners_mm)
+    return np.degrees(np.arctan2(-ex[1], -ex[0]))
 
 
 def wood_local(corners_mm, x, y):
@@ -305,7 +312,7 @@ def text_paths(text, height=4.0, x=0.0, y=0.0, align="center"):
 def test_pattern(corners_mm, z, calib_residual_mm):
     """Corner brackets + nested-squares whirl + a stats block, all in the workpiece frame."""
     c, ex, ey, (w, h) = rect_frame(corners_mm)
-    rot = np.degrees(np.arctan2(ex[1], ex[0]))
+    rot = frame_rotation_deg(corners_mm)
     stats = [
         f"{w:.1f} x {h:.1f} mm   ctr ({c[0]:.1f}, {c[1]:.1f})   rot {rot:+.2f} deg",
         f"Z {z:.2f} mm   calib {calib_residual_mm:.2f} mm   {datetime.date.today().isoformat()}",
@@ -355,7 +362,7 @@ if __name__ == "__main__":
             save("photo.jpg", img)
             c, ex, ey, (w, h) = rect_frame(corners)
             print("workpiece corners mm:\n", corners.round(1))
-            print(f"center {c.round(1)} size {w:.1f} x {h:.1f} mm, rotation {np.degrees(np.arctan2(ex[1], ex[0])):.2f} deg")
+            print(f"center {c.round(1)} size {w:.1f} x {h:.1f} mm, rotation {frame_rotation_deg(corners):.2f} deg")
             save("workpiece.json", {"corners_mm": corners, "corners_px": quad_px, "center": c, "size": [w, h]})
             plot_alignment(img, H, corners, [], f"{OUT}/workpiece.png")
         elif cmd == "test":
@@ -370,7 +377,7 @@ if __name__ == "__main__":
             paths = test_pattern(corners, z, residual_mm)
             c, ex, ey, (w, h) = rect_frame(corners)
             save("workpiece.json", {"corners_mm": corners, "corners_px": quad_px, "center": c, "size": [w, h],
-                                    "rotation_deg": np.degrees(np.arctan2(ex[1], ex[0])), "z_mm": z})
+                                    "rotation_deg": frame_rotation_deg(corners), "z_mm": z})
             save("paths_mm.json", paths)
             save("job.gcode", make_cut_gcode(paths, 80.0, 4500.0))
             plot_alignment(img, H, corners, paths, f"{OUT}/plan.png")
