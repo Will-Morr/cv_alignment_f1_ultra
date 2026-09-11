@@ -371,16 +371,25 @@ class F1Ultra:
     def autofocus(self, timeout=120):
         """Run the built-in height measurement and move to focus (~30 s). Returns the measured Z (mm).
         The start command is occasionally ignored; it is re-sent if no FOCUS_STARTED event follows."""
-        self.set_mode("P_IDLE")
-        time.sleep(1)
-        self.set_mode("P_AUTOFOCUS")
-        time.sleep(1)   # auto_start is ignored if sent before the mode switch settles
         seen = len(self.events)
         started = False
         t0 = time.time()
         for attempt in range(3):
-            self.request("/v1/laser-head/focus/control", "POST",
-                         data={"action": "auto_start", "stopFirst": 1}, timeout=timeout)
+            # the mode switch is sometimes slow or ignored; confirm it before starting
+            self.set_mode("P_IDLE")
+            time.sleep(1)
+            for _ in range(10):
+                self.set_mode("P_AUTOFOCUS")
+                time.sleep(1)
+                if self.status()["curMode"]["mode"] == "P_AUTOFOCUS":
+                    break
+            try:
+                self.request("/v1/laser-head/focus/control", "POST",
+                             data={"action": "auto_start", "stopFirst": 1}, timeout=timeout)
+            except RuntimeError as e:   # code 1 = refused (not in autofocus mode yet)
+                print("autofocus start refused, retrying:", e)
+                time.sleep(2)
+                continue
             t1 = time.time()
             while time.time() - t1 < 6 and not started:
                 self.status()
