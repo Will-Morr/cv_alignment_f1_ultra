@@ -190,9 +190,27 @@ def burn_and_locate(laser, points_mm, pairs, tag):
     return img
 
 
+Z_TOLERANCE = 1.5   # mm; the camera rides on the head, so the homography only holds near the calibration Z
+
+
+def focus(laser, calib=None):
+    """Autofocus and check the result against the Z the calibration was made at.
+    A far-off value means a different material thickness (recalibrate) or a bad measurement."""
+    z_ref = (calib or {}).get("z_mm")
+    for attempt in range(2):
+        z = laser.autofocus()
+        print(f"autofocus Z = {z} mm" + (f" (calibration at {z_ref} mm)" if z_ref else ""))
+        if z_ref is None or abs(z - z_ref) <= Z_TOLERANCE:
+            return z
+    raise RuntimeError(f"autofocus Z {z} mm is {z - z_ref:+.1f} mm from the calibration Z {z_ref} mm; "
+                       "different material thickness? run calibrate again")
+
+
 def calibrate(laser, cluster=(120, 115), spread=20, inset=15):
     """Two passes: a small cluster of marks (no assumptions about camera orientation), then marks
-    near the workpiece corners predicted from pass 1. Fits and saves the mm->px homography."""
+    near the workpiece corners predicted from pass 1. Fits and saves the mm->px homography.
+    Autofocuses first and records the Z, since the mapping is only valid at that head height."""
+    z = focus(laser)
     cx, cy = cluster
     pairs = []
     img = burn_and_locate(laser, [(cx - spread, cy - spread), (cx + spread, cy - spread),
@@ -206,7 +224,7 @@ def calibrate(laser, cluster=(120, 115), spread=20, inset=15):
     img = burn_and_locate(laser, pts, pairs, "calib2")
     H, err = _fit(pairs)
     print(f"homography fit: {len(pairs)} points, residual px max {err.max():.2f} mean {err.mean():.2f}")
-    json.dump({"H_mm_to_px": H.tolist(), "pairs": pairs, "residual_px": err.tolist(),
+    json.dump({"H_mm_to_px": H.tolist(), "pairs": pairs, "residual_px": err.tolist(), "z_mm": z,
                "img_size": [IMG_W, IMG_H], "fill_light": FILL_LIGHT,
                "date": datetime.date.today().isoformat()}, open(CALIB_FILE, "w"), indent=1)
     shutil.copy(CALIB_FILE, OUT)
@@ -370,8 +388,7 @@ if __name__ == "__main__":
             # photograph before autofocus: the camera is unreliable for a while after the head moves
             corners, quad_px, img = wood_mm(laser, H)
             save("photo_before.jpg", img)
-            z = laser.autofocus()
-            print(f"autofocus Z = {z} mm")
+            z = focus(laser, calib)
             residual_px = calib.get("residual_px") or _fit(calib["pairs"])[1].tolist()
             residual_mm = max(residual_px) / np.linalg.norm(np.diff(mm_to_px(H, [(0, 0), (1, 0)]), axis=0))
             paths = test_pattern(corners, z, residual_mm)

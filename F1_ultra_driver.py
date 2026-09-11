@@ -403,7 +403,8 @@ class F1Ultra:
                 zs = [e["data"]["info"]["z"] for e in self.events[seen:] if e.get("url") == "/laser_head/value"]
                 return zs[-1] if zs else None
             time.sleep(0.5)
-        raise TimeoutError("autofocus did not finish")
+        raise TimeoutError("autofocus did not finish; events: " + str(
+            [(e.get("url"), e["data"].get("type"), e["data"].get("info")) for e in self.events[seen:] if "config" not in e.get("url", "")]))
 
     def run_job(self, xf_bytes, auto_start=True, timeout=600):
         """Upload a .xf package and (optionally) start it. Blocks until the job finishes."""
