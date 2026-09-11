@@ -1,0 +1,5 @@
+websockets>=12
+numpy
+opencv-python
+matplotlib
+Pillow
