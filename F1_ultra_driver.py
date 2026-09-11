@@ -369,18 +369,29 @@ class F1Ultra:
                             data={"action": "goTo", "Z": z, "stopFirst": 1, "F": 5000}, timeout=60)
 
     def autofocus(self, timeout=120):
-        """Run the built-in height measurement and move to focus (~30 s). Returns the measured Z (mm)."""
+        """Run the built-in height measurement and move to focus (~30 s). Returns the measured Z (mm).
+        The start command is occasionally ignored; it is re-sent if no FOCUS_STARTED event follows."""
         self.set_mode("P_IDLE")
         time.sleep(1)
         self.set_mode("P_AUTOFOCUS")
         time.sleep(1)   # auto_start is ignored if sent before the mode switch settles
-        self.request("/v1/laser-head/focus/control", "POST",
-                     data={"action": "auto_start", "stopFirst": 1}, timeout=timeout)
+        seen = len(self.events)
+        started = False
         t0 = time.time()
+        for attempt in range(3):
+            self.request("/v1/laser-head/focus/control", "POST",
+                         data={"action": "auto_start", "stopFirst": 1}, timeout=timeout)
+            t1 = time.time()
+            while time.time() - t1 < 6 and not started:
+                self.status()
+                started = any(e["data"].get("type") == "FOCUS_STARTED" for e in self.events[seen:])
+                time.sleep(0.5)
+            if started:
+                break
         while time.time() - t0 < timeout:
             self.status()   # drains push events
-            if any(e["data"].get("type") == "FOCUS_FINISHED" for e in self.events):
-                zs = [e["data"]["info"]["z"] for e in self.events if e.get("url") == "/laser_head/value"]
+            if any(e["data"].get("type") == "FOCUS_FINISHED" for e in self.events[seen:]):
+                zs = [e["data"]["info"]["z"] for e in self.events[seen:] if e.get("url") == "/laser_head/value"]
                 return zs[-1] if zs else None
             time.sleep(0.5)
         raise TimeoutError("autofocus did not finish")
