@@ -1,5 +1,10 @@
 # cv_alignment_f1_ultra
 
+> **Heads up: this is all vibe code.** It was written by Claude Code in one session, driving a
+> real F1 Ultra over the LAN and iterating until the engravings lined up. It works on one machine,
+> one firmware, one plywood square. You do not need to read any of it; run the commands below and
+> look at what comes out on the wood.
+
 Camera-based workpiece alignment for the xTool F1 Ultra over its LAN API,
 plus a Python driver for the "V2" protocol that newer firmware (>= 40.52) uses.
 
