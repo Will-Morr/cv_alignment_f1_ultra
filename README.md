@@ -43,7 +43,7 @@ with f1.F1Ultra() as laser:
     H, _ = align.load_calib()
     corners, quad_px, img = align.wood_mm(laser, H)
     paths = align.align_paths(my_paths_mm, corners, margin=5)   # scale/rotate/translate into the workpiece
-    align.burn(laser, paths, power=80, speed=3000)
+    laser.burn(paths, power=80, speed=4500)
 ```
 
 ## Run records
